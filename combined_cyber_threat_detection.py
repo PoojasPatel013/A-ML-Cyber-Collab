@@ -2,153 +2,174 @@ import pandas as pd
 import numpy as np
 import glob
 import os
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 import gc
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-class CombinedDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = X
-        self.y = y
-    
-    def __len__(self):
-        return len(self.X)
-    
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-def detect_target_column(df):
-    """Detect target column from common names"""
-    possible_targets = ['Label', 'Prediction', 'Attack_type', 'attack', 'Type', 'phishing']
-    for col in possible_targets:
-        if col in df.columns:
-            return col
-    return None
-
-def load_and_combine_data():
-    """Load and combine all datasets"""
-    try:
-        data_dir = 'data'
-        all_files = glob.glob(os.path.join(data_dir, "*.csv"))
+class CombinedCyberThreatDataset(Dataset):
+    def __init__(self, data_dir, batch_size=1024):
+        self.batch_size = batch_size
+        self.data_dir = data_dir
+        self.all_files = glob.glob(os.path.join(data_dir, "*.csv"))
+        self.current_file_idx = 0
+        self.current_chunk = None
+        self.feature_columns = None
+        self.label_encoder = LabelEncoder()
+        self._load_next_file()
         
-        if not all_files:
-            raise ValueError("No CSV files found in the data directory")
-            
-        print(f'\nFound {len(all_files)} CSV files:')
-        for filename in all_files:
-            print(os.path.basename(filename))
-            
-        all_data = []
-        all_targets = []
+    def _load_next_file(self):
+        if self.current_file_idx >= len(self.all_files):
+            self.current_file_idx = 0
+        current_file = self.all_files[self.current_file_idx]
+        print(f"Loading file: {current_file}")
         
-        # Process each file
-        for filename in all_files:
-            print(f"\nProcessing file: {filename}")
-            df = pd.read_csv(filename, low_memory=False)
+        # Read file
+        df = pd.read_csv(current_file, low_memory=False)
+        
+        # Detect target column
+        target_col = self._detect_target_column(df)
+        if not target_col:
+            raise ValueError(f"Could not detect target column in {current_file}")
             
-            # Detect target column
-            target_col = detect_target_column(df)
-            if not target_col:
-                print(f"Warning: Could not detect target column in {filename}")
-                continue
+        # Process features
+        X, y = self._process_file(df, target_col)
+        self.current_chunk = {'X': X, 'y': y}
+        self.current_file_idx += 1
+        
+    def _detect_target_column(self, df):
+        patterns = ['Label', 'Prediction', 'Type', 'phishing', 'Attack_type', 'attack']
+        for pattern in patterns:
+            matching_cols = [col for col in df.columns if pattern.lower() in col.lower()]
+            if matching_cols:
+                return matching_cols[0]
+        return None
+        
+    def _process_file(self, df, target_col):
+        # Save feature columns if not already set
+        if self.feature_columns is None:
+            self.feature_columns = df.drop(target_col, axis=1).columns.tolist()
+            print(f"Feature columns set: {len(self.feature_columns)}")
+            
+        # Align features with saved columns
+        df_aligned = pd.DataFrame(columns=self.feature_columns)
+        for col in self.feature_columns:
+            if col in df.columns:
+                df_aligned[col] = df[col]
+            else:
+                df_aligned[col] = 0  # Fill missing features with 0
                 
-            # Get features and target
-            X = df.drop(target_col, axis=1)
-            y = df[target_col]
-            
-            # Convert to numeric
-            X = X.apply(pd.to_numeric, errors='coerce').fillna(0)
-            
-            # Add file identifier as a feature
-            file_id = os.path.basename(filename).split('.')[0]
-            X['file_id'] = file_id
-            
-            all_data.append(X)
-            all_targets.append(y)
-            
-            print(f"Added {len(X)} samples from {filename}")
-            
-        # Combine all datasets
-        combined_X = pd.concat(all_data, ignore_index=True)
-        combined_y = pd.concat(all_targets, ignore_index=True)
+        X = df_aligned
+        y = df[target_col]
         
-        # Convert to PyTorch tensors
-        X_tensor = torch.tensor(combined_X.values, dtype=torch.float32)
-        y_tensor = torch.tensor(combined_y.values, dtype=torch.long)
+        # Encode categorical features
+        categorical_cols = X.select_dtypes(include=['object']).columns
+        for col in categorical_cols:
+            X[col] = pd.factorize(X[col])[0]
+            
+        # Convert to numeric
+        X = X.apply(pd.to_numeric, errors='coerce').fillna(0)
         
-        print(f"\nCombined dataset shape:")
-        print(f"Features: {X_tensor.shape}")
-        print(f"Targets: {y_tensor.shape}")
+        # Encode labels
+        y = self.label_encoder.fit_transform(y.astype(str))
         
-        return X_tensor, y_tensor
+        return X, y
         
-    except Exception as e:
-        print(f"Error combining data: {e}")
-        return None, None
+    def __len__(self):
+        if self.current_chunk is None:
+            self._load_next_file()
+        return len(self.current_chunk['X'])
+        
+    def __getitem__(self, idx):
+        try:
+            if self.current_chunk is None:
+                self._load_next_file()
+                
+            X = self.current_chunk['X'].iloc[idx].values
+            y = self.current_chunk['y'].iloc[idx]
+            
+            # Convert to tensors
+            X = torch.tensor(X, dtype=torch.float32)
+            y = torch.tensor(y, dtype=torch.long)
+            
+            return X, y
+            
+        except Exception as e:
+            print(f"Error processing item: {e}")
+            raise
 
-class CombinedCyberThreatModel(nn.Module):
+class CombinedCyberThreatCNN(nn.Module):
     def __init__(self, input_size, num_classes):
-        super(CombinedCyberThreatModel, self).__init__()
+        super(CombinedCyberThreatCNN, self).__init__()
         
         # Feature extraction layers
         self.feature_extractor = nn.Sequential(
-            nn.Linear(input_size, 512),
+            nn.Conv1d(1, 128, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.BatchNorm1d(512),
-            nn.Dropout(0.3),
+            nn.BatchNorm1d(128),
+            nn.MaxPool1d(2),
             
-            nn.Linear(512, 256),
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.BatchNorm1d(256),
-            nn.Dropout(0.3)
+            nn.MaxPool1d(2),
+            
+            nn.Conv1d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.MaxPool1d(2)
         )
+        
+        # Calculate output size
+        self.output_size = self._get_output_size(input_size)
         
         # Classification head
         self.classifier = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(self.output_size, 1024),
             nn.ReLU(),
-            nn.BatchNorm1d(128),
             nn.Dropout(0.3),
             
-            nn.Linear(128, 64),
+            nn.Linear(1024, 512),
             nn.ReLU(),
-            nn.BatchNorm1d(64),
             nn.Dropout(0.3),
             
-            nn.Linear(64, num_classes)
+            nn.Linear(512, num_classes)
         )
     
+    def _get_output_size(self, input_size):
+        x = torch.randn(1, 1, input_size)
+        x = self.feature_extractor(x)
+        return x.view(x.size(0), -1).size(1)
+    
     def forward(self, x):
-        features = self.feature_extractor(x)
-        output = self.classifier(features)
-        return output
+        x = x.unsqueeze(1)  # Add channel dimension
+        x = self.feature_extractor(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
 
-def train_combined_model(X, y):
-    """Train the combined model"""
+def train_combined_model(data_dir, batch_size=1024):
     try:
-        print("\nTraining combined model...")
-        
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, stratify=y, random_state=42
-        )
+        print("\nTraining combined CNN model...")
         
         # Create dataset and dataloader
-        train_dataset = CombinedDataset(X_train, y_train)
-        train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+        dataset = CombinedCyberThreatDataset(data_dir, batch_size=batch_size)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+        
+        # Get first batch to determine input size and number of classes
+        X_sample, y_sample = next(iter(dataloader))
+        input_size = X_sample.shape[2]
+        num_classes = len(torch.unique(y_sample))
         
         # Initialize model, loss, and optimizer
-        model = CombinedCyberThreatModel(X.shape[1], len(torch.unique(y)))
+        model = CombinedCyberThreatCNN(input_size, num_classes)
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         
@@ -159,7 +180,6 @@ def train_combined_model(X, y):
         # Training loop
         num_epochs = 50
         best_accuracy = 0
-        history = {'train_loss': [], 'train_acc': [], 'val_acc': []}
         
         for epoch in range(num_epochs):
             model.train()
@@ -167,73 +187,54 @@ def train_combined_model(X, y):
             correct = 0
             total = 0
             
-            for inputs, labels in train_loader:
+            for i, (X, y) in enumerate(dataloader):
                 optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
+                outputs = model(X.squeeze(0))
+                loss = criterion(outputs, y.squeeze(0))
                 loss.backward()
                 optimizer.step()
                 
                 running_loss += loss.item()
                 _, predicted = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+                total += y.size(1)
+                correct += (predicted == y.squeeze(0)).sum().item()
+                
+                if (i + 1) % 10 == 0:
+                    print(f'Epoch [{epoch+1}/{num_epochs}], Batch [{i+1}/{len(dataloader)}], Loss: {running_loss:.4f}')
             
             train_acc = 100 * correct / total
-            history['train_loss'].append(running_loss)
-            history['train_acc'].append(train_acc)
-            
             print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss:.4f}, Train Acc: {train_acc:.2f}%')
-        
-        # Evaluate on test set
-        model.eval()
-        with torch.no_grad():
-            outputs = model(X_test)
-            _, predicted = torch.max(outputs.data, 1)
-            test_acc = 100 * (predicted == y_test).sum().item() / y_test.size(0)
-            print(f'\nTest Accuracy: {test_acc:.2f}%')
-            
-            # Save classification report
-            report = classification_report(y_test.numpy(), predicted.numpy(), output_dict=True)
-            report_file = os.path.join(save_dir, 'combined_report.json')
-            with open(report_file, 'w') as f:
-                json.dump(report, f, indent=4)
         
         # Save model
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        model_file = os.path.join(save_dir, f'combined_pytorch_model_{timestamp}.pth')
+        model_file = os.path.join(save_dir, f'combined_cnn_model_{timestamp}.pth')
         torch.save(model.state_dict(), model_file)
-        print(f"Combined model saved to: {model_file}")
+        print(f"Combined CNN model saved to: {model_file}")
         
-        # Plot training history
-        plt.figure(figsize=(12, 6))
-        plt.plot(history['train_loss'], label='Training Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training Loss')
-        plt.legend()
-        plt.savefig(os.path.join(save_dir, 'training_loss.png'))
-        plt.close()
+        # Save label encoder
+        le_file = os.path.join(save_dir, f'label_encoder_{timestamp}.pkl')
+        import joblib
+        joblib.dump(dataset.label_encoder, le_file)
+        print(f"Label encoder saved to: {le_file}")
         
-        return model, test_acc
+        return model
         
     except Exception as e:
         print(f"Error training combined model: {e}")
-        return None, 0
+        raise
 
 def main():
     try:
-        # Load and combine all data
-        X, y = load_and_combine_data()
-        if X is None or y is None:
-            print("Failed to load and combine data")
-            return
-            
-        # Train combined model
-        model, test_acc = train_combined_model(X, y)
-        if model:
-            print(f"\nCombined model training complete. Test Accuracy: {test_acc:.2f}%")
+        # Create necessary directories
+        os.makedirs('models_combined', exist_ok=True)
         
+        # Train combined model
+        data_dir = 'data'
+        model = train_combined_model(data_dir)
+        
+        if model:
+            print("\nSuccessfully trained combined CNN model")
+            
     except Exception as e:
         print(f"Error in main: {e}")
 

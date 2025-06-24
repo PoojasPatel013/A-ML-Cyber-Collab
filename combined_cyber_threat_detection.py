@@ -23,12 +23,22 @@ class CombinedCyberThreatDataset(Dataset):
         self.num_classes = None
         self._load_and_combine_data()
         
+        # Validate the combined data
+        if self.X is not None and self.y is not None:
+            assert len(self.X) == len(self.y), "X and y must have same length"
+            self.num_classes = len(np.unique(self.y))
+            print(f"\nFinal dataset stats:")
+            print(f"Total samples: {len(self.X)}")
+            print(f"Number of features: {self.X.shape[1]}")
+            print(f"Number of classes: {self.num_classes}")
+            print(f"Class distribution: {np.bincount(self.y)}")
+            print(f"Memory usage: {self.X.nbytes / 1e6:.2f} MB")
+        else:
+            raise ValueError("No valid data loaded from files")
+            
     def get_num_classes(self):
         """Get the number of unique classes in the dataset"""
-        if self.y is not None:
-            self.num_classes = len(np.unique(self.y))
-            return self.num_classes
-        return None
+        return self.num_classes if self.num_classes is not None else 0
         
     def _load_and_combine_data(self):
         """Load and combine data from files efficiently"""
@@ -255,18 +265,33 @@ class CombinedCyberThreatCNN(nn.Module):
         x = self.classifier(x)
         return x
 
-def train_combined_model(data_dir):
+def train_combined_model(pickle_file='prepared_data.pkl'):
     try:
         print("\nTraining combined CNN model...")
         
-        # Create dataset and dataloader
-        dataset = CombinedCyberThreatDataset(data_dir)
-        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+        # Load prepared data from pickle
+        dataset = CombinedCyberThreatDataset('')  # Empty data_dir since we're loading from pickle
+        dataset.load_prepared_data(pickle_file)
         
-        # Get first batch to determine input size and number of classes
-        X_sample, y_sample = next(iter(dataloader))
-        input_size = X_sample.shape[1]  
-        num_classes = len(torch.unique(y_sample))
+        # Create custom dataset class for training
+        class CombinedDataset(Dataset):
+            def __init__(self, X, y):
+                self.X = X
+                self.y = y
+            
+            def __len__(self):
+                return len(self.X)
+            
+            def __getitem__(self, idx):
+                return torch.tensor(self.X[idx], dtype=torch.float32), torch.tensor(self.y[idx], dtype=torch.long)
+        
+        # Create dataset and dataloader
+        train_dataset = CombinedDataset(dataset.X, dataset.y)
+        dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+        
+        # Get input size and number of classes from dataset
+        input_size = dataset.X.shape[1]
+        num_classes = dataset.get_num_classes()
         
         # Initialize model, loss, and optimizer
         model = CombinedCyberThreatCNN(input_size, num_classes)
@@ -280,8 +305,15 @@ def train_combined_model(data_dir):
         # Training loop
         num_epochs = 50
         best_accuracy = 0
+        best_epoch = 0
+        patience = 10  # Early stopping patience
+        no_improvement_count = 0
         
         print(f"\nStarting training with input size: {input_size}, num_classes: {num_classes}")
+        print(f"Total samples: {len(train_dataset)}")
+        print(f"Feature shape: {dataset.X.shape}")
+        print(f"Class distribution: {np.bincount(dataset.y)}")
+        print(f"Memory usage: {dataset.X.nbytes / 1e6:.2f} MB")
         print(f"Total samples: {len(dataset)}")
         
         for epoch in range(num_epochs):
@@ -303,7 +335,7 @@ def train_combined_model(data_dir):
                 correct += (predicted == y).sum().item()
                 
                 if (i + 1) % 10 == 0:
-                    print(f'Epoch [{epoch+1}/{num_epochs}], Batch [{i+1}/{len(dataloader)}], Loss: {running_loss:.4f}')
+                    print(f'Epoch [{epoch+1}/{num_epochs}], Batch [{i+1}/{len(dataloader)}], Loss: {loss.item():.4f}')
             
             train_acc = 100 * correct / total
             print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss:.4f}, Train Acc: {train_acc:.2f}%')
@@ -311,10 +343,29 @@ def train_combined_model(data_dir):
             # Save best model
             if train_acc > best_accuracy:
                 best_accuracy = train_acc
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                model_file = os.path.join(save_dir, f'combined_cnn_model_{timestamp}.pth')
-                torch.save(model.state_dict(), model_file)
+                best_epoch = epoch
+                no_improvement_count = 0
+                
+                # Save the model
+                model_file = os.path.join(save_dir, 'combined_cnn_model.pth')
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'epoch': epoch,
+                    'accuracy': train_acc
+                }, model_file)
                 print(f"Saved best model with accuracy: {train_acc:.2f}%")
+            else:
+                no_improvement_count += 1
+                
+            # Early stopping
+            if no_improvement_count >= patience:
+                print(f"Early stopping at epoch {epoch} after {patience} epochs without improvement")
+                break
+        
+        print(f"\nTraining complete!")
+        print(f"Best accuracy: {best_accuracy:.2f}% at epoch {best_epoch + 1}")
+        print(f"Model saved to: {model_file}")
         
         return model
         
